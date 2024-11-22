@@ -1,11 +1,9 @@
-import pandas as pd
+import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
-import matplotlib.pyplot as plt
-from datetime import datetime
-from scipy import stats
+from sklearn.preprocessing import StandardScaler
 
 
 def create_sample_data(n_samples=1000):
