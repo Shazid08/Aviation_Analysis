@@ -1,206 +1,236 @@
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from scipy import stats
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
+from scipy.stats import norm
+import joblib
 
 
-class AviationSurvivalAnalyzer:
+class SurvivalProbabilityAnalyzer:
     def __init__(self, data_path):
         self.data = pd.read_csv(data_path)
         self.features = ['year', 'aboard', 'ground', 'fatalities_ratio', 'ground_to_aboard_ratio']
         self.target = 'survival_rate'
+        self.scaler = StandardScaler()
+        self.model = None
+        self.bootstrap_predictions = None
 
-    def analyze_fatalities_relationship(self):
-        """Analyze the relationship between fatalities and survival rate"""
-        plt.figure(figsize=(15, 10))
+    def prepare_data(self):
+        """Prepare data for modeling"""
+        X = self.data[self.features]
+        y = self.data[self.target]
 
-        # Create subplot grid
-        gs = plt.GridSpec(2, 2)
+        # Scale features
+        X_scaled = self.scaler.fit_transform(X)
+        X_scaled = pd.DataFrame(X_scaled, columns=self.features)
 
-        # 1. Scatter plot with regression line
-        ax1 = plt.subplot(gs[0, :])
-        sns.regplot(data=self.data,
-                    x='fatalities_ratio',
-                    y=self.target,
-                    scatter_kws={'alpha': 0.5},
-                    line_kws={'color': 'red'})
-        plt.title('Survival Rate vs Fatalities Ratio')
-        plt.xlabel('Fatalities Ratio')
-        plt.ylabel('Survival Rate')
+        # Split data
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            X_scaled, y, test_size=0.2, random_state=42
+        )
+        return self
 
-        # Calculate correlation statistics
-        correlation = stats.pearsonr(self.data['fatalities_ratio'],
-                                     self.data[self.target])
-        plt.text(0.05, 0.95,
-                 f'Correlation: {correlation[0]:.4f}\np-value: {correlation[1]:.4e}',
-                 transform=ax1.transAxes,
-                 bbox=dict(facecolor='white', alpha=0.8))
+    def train_probability_model(self):
+        """Train ensemble model for probability estimation"""
+        # Train Random Forest with probability estimation
+        self.model = RandomForestRegressor(
+            n_estimators=1000,
+            min_samples_leaf=5,
+            random_state=42,
+            bootstrap=True
+        )
+        self.model.fit(self.X_train, self.y_train)
 
-        # 2. Fatalities ratio distribution
-        ax2 = plt.subplot(gs[1, 0])
-        sns.histplot(data=self.data, x='fatalities_ratio', bins=30)
-        plt.title('Distribution of Fatalities Ratio')
-        plt.xlabel('Fatalities Ratio')
+        # Generate bootstrap predictions for uncertainty estimation
+        self.bootstrap_predictions = np.zeros((len(self.X_test), 100))
+        for i in range(100):
+            # Bootstrap sample
+            idx = np.random.randint(0, len(self.X_train), len(self.X_train))
+            X_boot = self.X_train.iloc[idx]
+            y_boot = self.y_train.iloc[idx]
 
-        # 3. Custom binning for fatalities ratio
-        ax3 = plt.subplot(gs[1, 1])
-        # Create manual bins to avoid duplicate edges
-        bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
-        labels = ['0-20%', '20-40%', '40-60%', '60-80%', '80-100%']
-        self.data['fatality_category'] = pd.cut(self.data['fatalities_ratio'],
-                                                bins=bins,
-                                                labels=labels)
+            # Train and predict
+            model_boot = RandomForestRegressor(
+                n_estimators=100,
+                min_samples_leaf=5,
+                random_state=i
+            )
+            model_boot.fit(X_boot, y_boot)
+            self.bootstrap_predictions[:, i] = model_boot.predict(self.X_test)
 
-        avg_survival = self.data.groupby('fatality_category')[self.target].mean()
-        avg_survival.plot(kind='bar')
-        plt.title('Average Survival Rate by Fatalities Category')
-        plt.xticks(rotation=45)
+        return self
 
-        plt.tight_layout()
-        plt.show()
+    def calculate_survival_probabilities(self):
+        """Calculate survival probabilities with confidence intervals"""
+        # Mean predictions
+        y_pred_mean = self.model.predict(self.X_test)
 
-    def temporal_trend_analysis(self):
-        """Analyze temporal trends in survival rates"""
-        plt.figure(figsize=(15, 12))
+        # Calculate confidence intervals from bootstrap predictions
+        y_pred_lower = np.percentile(self.bootstrap_predictions, 2.5, axis=1)
+        y_pred_upper = np.percentile(self.bootstrap_predictions, 97.5, axis=1)
 
-        # 1. Time series plot with moving average
-        ax1 = plt.subplot(311)
-        yearly_avg = self.data.groupby('year')[self.target].mean()
-        yearly_avg.plot(style='o-', alpha=0.5, label='Yearly Average')
+        return pd.DataFrame({
+            'actual': self.y_test,
+            'predicted': y_pred_mean,
+            'lower_bound': y_pred_lower,
+            'upper_bound': y_pred_upper
+        })
 
-        # Add 5-year moving average
-        ma = yearly_avg.rolling(window=5, min_periods=1).mean()
-        ma.plot(style='r-', linewidth=2, label='5-Year Moving Average')
+    def analyze_risk_factors(self):
+        """Analyze key risk factors affecting survival probability"""
+        feature_importance = pd.DataFrame({
+            'feature': self.features,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
 
-        plt.title('Survival Rate Trends Over Time')
-        plt.xlabel('Year')
-        plt.ylabel('Average Survival Rate')
-        plt.legend()
+        # Calculate partial dependence for top features
+        top_features = feature_importance.head(3)['feature'].values
+        partial_dependence = {}
 
-        # 2. Decade analysis
-        ax2 = plt.subplot(312)
-        self.data['decade'] = (self.data['year'] // 10) * 10
-        decade_stats = self.data.groupby('decade').agg({
-            self.target: ['mean', 'std', 'count']
-        }).round(4)
+        for feature in top_features:
+            # Create feature grid
+            feature_idx = self.features.index(feature)
+            feature_values = np.linspace(
+                self.X_test.iloc[:, feature_idx].min(),
+                self.X_test.iloc[:, feature_idx].max(),
+                50
+            )
 
-        decade_stats[self.target]['mean'].plot(kind='bar',
-                                               yerr=decade_stats[self.target]['std'],
-                                               capsize=5)
-        plt.title('Average Survival Rate by Decade (with Standard Deviation)')
-        plt.xlabel('Decade')
-        plt.ylabel('Average Survival Rate')
+            # Calculate partial dependence
+            pd_values = []
+            for value in feature_values:
+                X_temp = self.X_test.copy()
+                X_temp.iloc[:, feature_idx] = value
+                pd_values.append(self.model.predict(X_temp).mean())
 
-        # 3. Recent trends
-        ax3 = plt.subplot(313)
-        recent_data = self.data[self.data['year'] >= self.data['year'].max() - 10]
-        sns.regplot(data=recent_data, x='year', y=self.target,
-                    scatter_kws={'alpha': 0.5})
-        plt.title('Survival Rate Trend in Last 10 Years')
-        plt.xlabel('Year')
-        plt.ylabel('Survival Rate')
+            partial_dependence[feature] = {
+                'values': feature_values,
+                'effects': pd_values
+            }
 
-        plt.tight_layout()
-        plt.show()
+        return feature_importance, partial_dependence
 
-    def analyze_size_impact(self):
-        """Analyze the relationship between aircraft size and survival"""
-        plt.figure(figsize=(15, 10))
+    def plot_probability_analysis(self, probabilities, risk_factors):
+        """Create comprehensive probability analysis plots"""
+        plt.figure(figsize=(20, 12))
 
-        # 1. Scatter plot
-        ax1 = plt.subplot(221)
-        plt.scatter(self.data['aboard'], self.data[self.target], alpha=0.5)
-        plt.title('Survival Rate vs Number of People Aboard')
-        plt.xlabel('Number Aboard')
-        plt.ylabel('Survival Rate')
+        # 1. Predicted vs Actual with confidence intervals
+        ax1 = plt.subplot(231)
+        plt.scatter(probabilities['actual'], probabilities['predicted'], alpha=0.5)
+        plt.plot([0, 1], [0, 1], 'r--')
+        plt.fill_between(
+            probabilities['actual'],
+            probabilities['lower_bound'],
+            probabilities['upper_bound'],
+            alpha=0.2
+        )
+        plt.title('Predicted vs Actual Survival Probabilities')
+        plt.xlabel('Actual Survival Rate')
+        plt.ylabel('Predicted Survival Rate')
 
-        # 2. Size categories using custom bins
-        size_bins = [0, 10, 50, 100, 200, float('inf')]
-        size_labels = ['Very Small', 'Small', 'Medium', 'Large', 'Very Large']
-        self.data['size_category'] = pd.cut(self.data['aboard'],
-                                            bins=size_bins,
-                                            labels=size_labels)
+        # 2. Feature Importance
+        ax2 = plt.subplot(232)
+        feature_importance = risk_factors[0]
+        sns.barplot(x='importance', y='feature', data=feature_importance)
+        plt.title('Feature Importance for Survival Probability')
 
-        ax2 = plt.subplot(222)
-        sns.boxplot(data=self.data, x='size_category', y=self.target)
-        plt.title('Survival Rate Distribution by Aircraft Size')
-        plt.xticks(rotation=45)
-
-        # 3. Size and fatalities relationship
-        ax3 = plt.subplot(212)
-        size_stats = self.data.groupby('size_category').agg({
-            self.target: 'mean',
-            'fatalities_ratio': 'mean',
-            'aboard': 'count'
-        }).round(4)
-
-        # Dual axis plot
-        ax3_twin = ax3.twinx()
-
-        bars1 = ax3.bar(np.arange(len(size_stats)) - 0.2,
-                        size_stats[self.target],
-                        width=0.4,
-                        color='blue',
-                        label='Survival Rate')
-        bars2 = ax3_twin.bar(np.arange(len(size_stats)) + 0.2,
-                             size_stats['fatalities_ratio'],
-                             width=0.4,
-                             color='red',
-                             label='Fatalities Ratio')
-
-        ax3.set_xticks(range(len(size_stats)))
-        ax3.set_xticklabels(size_stats.index, rotation=45)
-        ax3.set_ylabel('Average Survival Rate', color='blue')
-        ax3_twin.set_ylabel('Average Fatalities Ratio', color='red')
-        plt.title('Survival Rate and Fatalities Ratio by Aircraft Size')
-
-        # Add legends
-        lines1, labels1 = ax3.get_legend_handles_labels()
-        lines2, labels2 = ax3_twin.get_legend_handles_labels()
-        ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+        # 3. Partial Dependence Plots
+        partial_dependence = risk_factors[1]
+        for i, (feature, values) in enumerate(partial_dependence.items(), 1):
+            ax = plt.subplot(2, 3, i + 3)
+            plt.plot(values['values'], values['effects'])
+            plt.title(f'Partial Dependence Plot: {feature}')
+            plt.xlabel(feature)
+            plt.ylabel('Survival Probability')
 
         plt.tight_layout()
         plt.show()
 
-    def print_analysis_summary(self):
-        """Print comprehensive analysis summary"""
+    def calculate_risk_scores(self):
+        """Calculate risk scores for different scenarios"""
+        # Create representative scenarios
+        scenarios = pd.DataFrame({
+            'year': [2020, 2020, 2020],
+            'aboard': [100, 50, 200],
+            'ground': [0, 0, 0],
+            'fatalities_ratio': [0.2, 0.5, 0.8],
+            'ground_to_aboard_ratio': [0, 0, 0]
+        }, index=['Low Risk', 'Medium Risk', 'High Risk'])
+
+        # Scale scenarios
+        scenarios_scaled = pd.DataFrame(
+            self.scaler.transform(scenarios),
+            columns=self.features,
+            index=scenarios.index
+        )
+
+        # Predict probabilities
+        predictions = []
+        for _, scenario in scenarios_scaled.iterrows():
+            scenario_reshaped = scenario.values.reshape(1, -1)
+            pred = self.model.predict(scenario_reshaped)[0]
+
+            # Bootstrap predictions for confidence interval
+            boot_preds = []
+            for estimator in self.model.estimators_:
+                boot_preds.append(estimator.predict(scenario_reshaped)[0])
+
+            ci_lower = np.percentile(boot_preds, 2.5)
+            ci_upper = np.percentile(boot_preds, 97.5)
+
+            predictions.append({
+                'mean': pred,
+                'ci_lower': ci_lower,
+                'ci_upper': ci_upper
+            })
+
+        return pd.DataFrame(predictions, index=scenarios.index)
+
+    def print_probability_summary(self, risk_scores):
+        """Print comprehensive probability analysis summary"""
         print("\n" + "=" * 60)
-        print(" Advanced Survival Rate Analysis ".center(60, "="))
+        print(" Survival Probability Analysis ".center(60, "="))
         print("=" * 60 + "\n")
 
-        # Basic statistics
-        print("Basic Statistics:")
-        print(f"  Total Incidents:      {len(self.data)}")
-        print(f"  Mean Survival Rate:   {self.data[self.target].mean():.4f}")
-        print(f"  Median Survival Rate: {self.data[self.target].median():.4f}")
-        print(f"  Std Deviation:        {self.data[self.target].std():.4f}")
+        print("Model Performance:")
+        y_pred = self.model.predict(self.X_test)
+        print(f"  R² Score:             {r2_score(self.y_test, y_pred):.4f}")
+        print(f"  Mean Absolute Error:  {mean_absolute_error(self.y_test, y_pred):.4f}")
+        print(f"  Root Mean Sq Error:   {np.sqrt(mean_squared_error(self.y_test, y_pred)):.4f}")
 
-        # Feature correlations
-        print("\nFeature Correlations with Survival Rate:")
-        correlations = self.data[self.features + [self.target]].corr()[self.target]
-        for feature, corr in correlations.sort_values(ascending=False).items():
-            if feature != self.target:
-                print(f"  {feature:20}: {corr:8.4f}")
-
-        # Recent trends
-        recent_data = self.data[self.data['year'] >= self.data['year'].max() - 10]
-        print("\nRecent Trends (Last 10 Years):")
-        print(f"  Average Survival Rate: {recent_data[self.target].mean():.4f}")
-        print(
-            f"  Trend Direction:       {'Increasing' if recent_data.groupby('year')[self.target].mean().diff().mean() > 0 else 'Decreasing'}")
+        print("\nRisk Scenarios (Survival Probability):")
+        for scenario in risk_scores.index:
+            print(f"\n  {scenario}:")
+            print(f"    Mean Probability:    {risk_scores.loc[scenario, 'mean']:.4f}")
+            print(f"    95% CI:             ({risk_scores.loc[scenario, 'ci_lower']:.4f}, "
+                  f"{risk_scores.loc[scenario, 'ci_upper']:.4f})")
 
 
 # Run analysis
 if __name__ == "__main__":
     try:
-        analyzer = AviationSurvivalAnalyzer('Enhanced_Airplane_Crashes.csv')
-        analyzer.analyze_fatalities_relationship()
-        analyzer.temporal_trend_analysis()
-        analyzer.analyze_size_impact()
-        analyzer.print_analysis_summary()
+        analyzer = SurvivalProbabilityAnalyzer('Enhanced_Airplane_Crashes.csv')
+
+        # Train and evaluate model
+        analyzer.prepare_data()
+        analyzer.train_probability_model()
+
+        # Calculate probabilities and risk factors
+        probabilities = analyzer.calculate_survival_probabilities()
+        risk_factors = analyzer.analyze_risk_factors()
+
+        # Generate visualizations
+        analyzer.plot_probability_analysis(probabilities, risk_factors)
+
+        # Calculate and print risk scores
+        risk_scores = analyzer.calculate_risk_scores()
+        analyzer.print_probability_summary(risk_scores)
+
     except Exception as e:
         print(f"An error occurred: {str(e)}")
         import traceback
